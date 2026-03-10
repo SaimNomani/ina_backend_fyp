@@ -1,0 +1,38 @@
+[project]
+name = "ina-backend"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "SaimNomani",email = "muhammadsaimnomani951@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "fastapi (>=0.120.4,<0.121.0)",
+    "uvicorn (>=0.38.0,<0.39.0)",
+    "sqlalchemy[asyncio] (>=2.0.44,<3.0.0)",
+    "asyncpg (>=0.30.0,<0.31.0)",
+    "pydantic[email] (>=2.12.3,<3.0.0)",
+    "python-dotenv (>=1.2.1,<2.0.0)",
+    "pydantic-settings (>=2.11.0,<3.0.0)",
+    "python-jose[cryptography] (>=3.5.0,<4.0.0)",
+    "passlib[bcrypt] (==1.7.4)",
+    "bcrypt (==3.2.2)",
+    "python-multipart (>=0.0.20,<0.0.21)",
+    "alembic (>=1.17.1,<2.0.0)",
+    "httpx (>=0.28.1,<0.29.0)",
+    "redis (>=7.1.0,<8.0.0)",
+    "fastapi-limiter (>=0.1.6,<0.2.0)"
+]
+
+[tool.poetry]
+packages = [{include = "ina_backend", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=8.4.2,<9.0.0)",
+]
