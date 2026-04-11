@@ -1,57 +1,63 @@
-# --- ADD THESE IMPORTS AT THE TOP ---
 import uuid
-from ..schemas import SessionInitRequest, SessionInitResponse # Ensure you created schemas.py
+import json
+import logging
+from ..schemas import SessionInitRequest, SessionInitResponse
 from ..redis_client import redis_client
 from sqlalchemy.future import select
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from src.ina_backend.app.database import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Tenant
 from fastapi_limiter.depends import RateLimiter
 
-
-
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# --- NEW ENDPOINT: Week 3 Day 1 ---
+
 @router.post("/init", response_model=SessionInitResponse, dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def initialize_session(
-    payload: SessionInitRequest, 
+    payload: SessionInitRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Week 3 Push Model: Tenant initializes a session.
+    Tenant initializes a negotiation session.
     1. Validate API Key against Tenants table.
     2. Generate Session ID.
-    3. Push Context (MAM, Price) to Redis.
+    3. Store session as a JSON string in Redis (SET, not HSET).
+
+    Key format  : bare session_id UUID (no prefix)
+    Value format: JSON string
+    Reason      : AI Orchestrator reads via client.get(session_id) + json.loads(),
+                  so both the key format and value type must match exactly.
     """
-    
+
     # 1. Validate API Key
-    # We query the Tenants table to find the tenant with this api_key
     result = await db.execute(select(Tenant).where(Tenant.client_api_key == payload.api_key))
     tenant = result.scalars().first()
-    
+
     if not tenant:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # 2. Generate a unique Session ID for our system
+    # 2. Generate a unique Session ID
     session_id = str(uuid.uuid4())
 
-    # 3. Store data in Redis
-    # Key Format: "session:{session_id}"
-    # We store it as a Hash map for easy retrieval of specific fields
-    redis_key = f"session:{session_id}"
-    
-    await redis_client.hset(redis_key, mapping={
+    # 3. Store session in Redis
+    #    - Key  : bare UUID (no "session:" prefix) — matches client.get(session_id) in Orchestrator
+    #    - Value: JSON string                      — matches json.loads(raw) in Orchestrator
+    #    - TTL  : 24 hours
+    session_data = {
         "tenant_id": str(tenant.id),
         "context_id": payload.context_id,
-        "mam": str(payload.mam),
-        "asking_price": str(payload.asking_price),
-        "active": "true"
-    })
-    
-    # Set an expiration (TTL) so Redis doesn't fill up forever (e.g., 24 hours)
-    await redis_client.expire(redis_key, 86400)
+        "mam": payload.mam,           # stored as float, not string
+        "asking_price": payload.asking_price,
+        "active": True,
+    }
+    try:
+        await redis_client.set(session_id, json.dumps(session_data), ex=86400)
+        logger.info("Session stored: session_id=%s tenant_id=%s", session_id, tenant.id)
+    except Exception:
+        logger.exception("Failed to write session %s to Redis", session_id)
+        raise HTTPException(status_code=503, detail="Session store unavailable")
 
-    # 4. Return the Session ID
+    # 4. Return Session ID to frontend
     return SessionInitResponse(session_id=session_id, status="initialized")
