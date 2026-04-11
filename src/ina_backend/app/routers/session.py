@@ -51,6 +51,7 @@ async def initialize_session(
         "mam": payload.mam,           # stored as float, not string
         "asking_price": payload.asking_price,
         "active": True,
+        "messages": [],               # pre-initialize so orchestrator can safely append
     }
     try:
         await redis_client.set(session_id, json.dumps(session_data), ex=86400)
