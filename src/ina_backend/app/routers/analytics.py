@@ -1,4 +1,5 @@
 # --- IMPORTS ---
+import json
 from ..schemas import AnalyticsLogCreate
 from ..models import AnalyticsLog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,14 +30,15 @@ async def log_analytics(
     """
 
     # 1. Retrieve Session Data from Redis
-    redis_key = f"session:{payload.session_id}"
-    session_data = await redis_client.hgetall(redis_key)
+    #    Sessions are stored as bare UUID keys (no prefix) via SET + json.dumps
+    #    by session.py — so we must use get() + json.loads, not hgetall.
+    raw = await redis_client.get(payload.session_id)
 
-    if not session_data:
-        # If Redis returns empty, the session might have expired or is invalid.
-        # We can either reject it or save it as 'Unknown Tenant'. 
-        # For now, let's reject it to ensure data integrity.
+    if not raw:
+        # Session expired or never existed.
         raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    session_data = json.loads(raw)
 
     tenant_id = session_data.get("tenant_id")
 

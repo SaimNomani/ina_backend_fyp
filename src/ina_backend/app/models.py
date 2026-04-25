@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON
 from sqlalchemy.sql import func, text
 from .database import Base
 
@@ -28,3 +28,21 @@ class AnalyticsLog(Base):
     transcript_summary = Column(String) # A short summary of the chat
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class NegotiationOutcome(Base):
+    """Stores the final outcome when a negotiation ends (ACCEPTED / DEAL)."""
+    __tablename__ = "negotiation_outcomes"
+
+    id               = Column(Integer, primary_key=True, index=True)
+    session_id       = Column(String(255), unique=True, index=True, nullable=False)
+    outcome          = Column(String(50), nullable=False)          # "ACCEPTED", "DEAL"
+    asking_price     = Column(Float, nullable=False)
+    final_price      = Column(Float, nullable=False)
+    discount_percent = Column(Float, nullable=True)
+    total_turns      = Column(Integer, nullable=True)
+    user_language    = Column(String(50), nullable=True)
+    started_at       = Column(DateTime(timezone=True), nullable=True)
+    ended_at         = Column(DateTime(timezone=True), nullable=True)
+    message_history  = Column(JSON, nullable=True)                 # stored as jsonb array
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())

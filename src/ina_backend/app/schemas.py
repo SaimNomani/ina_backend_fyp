@@ -1,5 +1,6 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, List
+from datetime import datetime
 
 class TenantCreate(BaseModel):
     email: EmailStr
@@ -59,3 +60,43 @@ class AnalyticsSummary(BaseModel):
     total_deals: int
     total_volume: float   # Total value of all deals
     average_price: float
+
+
+# ---------------------------------------------------------------------------
+# Negotiation Outcomes — posted by the bargaining agent (fire-and-forget)
+# ---------------------------------------------------------------------------
+
+class NegotiationMessage(BaseModel):
+    """One turn in the negotiation message history."""
+    from_: str = Field(alias="from")   # "user" or "ina"  ('from' is a reserved keyword)
+    text: str
+    user_offer: Optional[float] = None
+    bot_offer: Optional[float] = None
+
+    class Config:
+        populate_by_name = True        # allow both 'from' and 'from_' on input
+
+
+class NegotiationOutcomeCreate(BaseModel):
+    """Payload the bargaining agent POSTs when a negotiation ends."""
+    session_id: str
+    outcome: str                       # "ACCEPTED" or "DEAL"
+    asking_price: float
+    final_price: float
+    discount_percent: Optional[float] = None
+    total_turns: Optional[int] = None
+    user_language: Optional[str] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    message_history: Optional[List[NegotiationMessage]] = None
+
+
+class NegotiationOutcomeResponse(BaseModel):
+    """Returned after a successful save."""
+    id: int
+    session_id: str
+    outcome: str
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
