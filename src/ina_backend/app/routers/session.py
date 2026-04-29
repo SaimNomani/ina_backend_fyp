@@ -1,13 +1,15 @@
 import uuid
 import json
 import logging
+
+from sqlalchemy import null
 from ..schemas import SessionInitRequest, SessionInitResponse
 from ..redis_client import redis_client
 from sqlalchemy.future import select
 from fastapi import APIRouter, Depends, HTTPException
 from src.ina_backend.app.database import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..models import Tenant
+from ..models import Tenant, NegotiationOutcome
 from fastapi_limiter.depends import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -52,13 +54,39 @@ async def initialize_session(
         "asking_price": payload.asking_price,
         "active": True,
         "messages": [],               # pre-initialize so orchestrator can safely append
+        "offer_count": 0,
+        "status": "negotiating",
+        "last_bot_offer": None,
     }
     try:
         await redis_client.set(session_id, json.dumps(session_data), ex=86400)
-        logger.info("Session stored: session_id=%s tenant_id=%s", session_id, tenant.id)
+        logger.info("Session stored: session_id=%s tenant_id=%s",
+                    session_id, tenant.id)
     except Exception:
         logger.exception("Failed to write session %s to Redis", session_id)
-        raise HTTPException(status_code=503, detail="Session store unavailable")
+        raise HTTPException(
+            status_code=503, detail="Session store unavailable")
 
     # 4. Return Session ID to frontend
     return SessionInitResponse(session_id=session_id, status="initialized")
+
+
+@router.get("/{session_id}/final_price", summary="Get final price for a completed session")
+async def get_final_price(
+    session_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Fetch the final agreed price for a completed negotiation by session ID.
+    """
+    result = await db.execute(
+        select(NegotiationOutcome.final_price)
+        .where(NegotiationOutcome.session_id == session_id)
+    )
+    final_price = result.scalars().first()
+
+    if final_price is None:
+        raise HTTPException(
+            status_code=404, detail="Outcome not found for this session")
+
+    return {"session_id": session_id, "final_price": final_price}
