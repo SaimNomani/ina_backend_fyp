@@ -11,6 +11,9 @@ class Tenant(Base):
     client_policy_api_endpoint = Column(String(512), nullable=True)
     client_api_key = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # for HMAC on /saas/verify
+    webhook_secret = Column(String(255), nullable=True)
+
     # add other fields (name, plan, etc.) as needed
 
 
