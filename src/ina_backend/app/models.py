@@ -16,18 +16,18 @@ class Tenant(Base):
 
 # Ensure Base is imported from database.py as you did in Week 1
 
-# class AnalyticsLog(Base):
-#     __tablename__ = "analytics_logs"
+class AnalyticsLog(Base):
+    __tablename__ = "analytics_logs"
 
-#     id = Column(Integer, primary_key=True, index=True)
-#     session_id = Column(String, unique=True, index=True) # Link to the session
-#     tenant_id = Column(Integer, ForeignKey("tenants.id")) # Link to the tenant
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True) # Link to the session
+    tenant_id = Column(Integer, ForeignKey("tenants.id")) # Link to the tenant
     
-#     result = Column(String)       # "DEAL", "NO_DEAL", "TIMEOUT"
-#     final_price = Column(Float)   # The agreed price (or null)
-#     transcript_summary = Column(String) # A short summary of the chat
+    result = Column(String)       # "DEAL", "NO_DEAL", "TIMEOUT"
+    final_price = Column(Float)   # The agreed price (or null)
+    transcript_summary = Column(String) # A short summary of the chat
     
-#     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class NegotiationOutcome(Base):
