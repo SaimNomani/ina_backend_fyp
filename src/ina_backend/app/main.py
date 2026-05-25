@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import auth, policy, tenant_config, session, analytics, negotiations
+from .routers import auth, policy, tenant_config, session, analytics, negotiations, saas_session, products, domains
 
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
@@ -47,6 +47,9 @@ app.include_router(tenant_config.router, prefix="/api/v1/tenant", tags=["Tenant 
 app.include_router(session.router, prefix="/api/v1/session", tags=["Session"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 app.include_router(negotiations.router, prefix="/api/negotiations", tags=["Negotiations"])
+app.include_router(saas_session.router, prefix="/api/saas/session", tags=["SaaS Session"])
+app.include_router(products.router, prefix="/api/saas/products", tags=["SaaS Products"])
+app.include_router(domains.router, prefix="/api/saas/domains", tags=["SaaS Domains"])
 
 
 @app.get("/")
