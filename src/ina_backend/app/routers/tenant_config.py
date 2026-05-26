@@ -42,7 +42,8 @@ async def set_tenant_config(
 
     return schemas.TenantConfigOut(
         client_policy_api_endpoint=updated_tenant.client_policy_api_endpoint,
-        client_api_key=updated_tenant.client_api_key
+        client_api_key=updated_tenant.client_api_key,
+        webhook_secret=updated_tenant.webhook_secret
     )
 
 
@@ -52,5 +53,6 @@ async def get_tenant_config(
 ):
     return schemas.TenantConfigOut(
         client_policy_api_endpoint=current_tenant.client_policy_api_endpoint,
-        client_api_key=current_tenant.client_api_key
+        client_api_key=current_tenant.client_api_key,
+        webhook_secret=current_tenant.webhook_secret
     )

@@ -30,6 +30,7 @@ class TenantConfigIn(BaseModel):
 class TenantConfigOut(BaseModel):
     client_policy_api_endpoint: str | None
     client_api_key: str | None
+    webhook_secret: str | None          # returned so dashboard can display it
 
 
 class TenantRuleInput(BaseModel):

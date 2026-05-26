@@ -27,7 +27,8 @@ async def register(payload: schemas.TenantCreate, db: AsyncSession = Depends(get
         email=payload.email,
         password_hash=hashed_pw,
         client_policy_api_endpoint=payload.client_policy_api_endpoint,
-        client_api_key=new_api_key
+        client_api_key=new_api_key,
+        webhook_secret=f"whsec_{secrets.token_hex(32)}"
     )
 
     db.add(new_tenant)
@@ -56,9 +57,15 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
             detail="Invalid credentials"
         )
 
-    # Backfill API key if missing
+    # Backfill API key and webhook_secret if missing
+    needs_backfill = False
     if not tenant.client_api_key:
         tenant.client_api_key = f"ina_key_{secrets.token_hex(16)}"
+        needs_backfill = True
+    if not tenant.webhook_secret:
+        tenant.webhook_secret = f"whsec_{secrets.token_hex(32)}"
+        needs_backfill = True
+    if needs_backfill:
         db.add(tenant)
         await db.commit()
         await db.refresh(tenant)

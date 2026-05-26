@@ -4,29 +4,37 @@ routers/products.py
 SaaS product-management endpoints — all require JWT auth (same mechanism as
 tenant_config.py / analytics.py).
 
+POST /api/saas/products
+    Manually add a single product.  Validates list_price > 0, mam > 0, and
+    mam <= list_price.  Returns 409 if the external_id already exists.
+
 POST /api/saas/products/upload
-    Accepts a multipart CSV file.  For each row, validates that mam <= list_price,
-    then upserts into TenantProduct (insert-or-update on (tenant_id, external_id)).
-    Returns a per-row summary: how many were inserted, updated, or skipped.
+    Accepts a multipart CSV file.  For each row, validates that mam <= list_price
+    and both values are > 0.  Rows whose external_id already exists are reported
+    as skipped (duplicate) instead of silently overwriting.
 
 GET  /api/saas/products
     Returns all active + inactive products belonging to the authenticated tenant,
-    sorted by name.  MAM is included because this is a server-to-dashboard call,
-    not a browser-to-widget call.
+    sorted by name.
 
 PUT  /api/saas/products/{product_id}
     Inline edit: accepts any subset of { name, list_price, mam, currency, active }.
-    Re-validates mam <= list_price after the patch is applied.
-    Only touches fields that are explicitly provided in the body.
+    Re-validates mam <= list_price and both > 0 after the patch is applied.
+
+DELETE /api/saas/products/{product_id}
+    Delete a single product by its DB id.
+
+POST /api/saas/products/bulk-delete
+    Delete multiple products at once.  Accepts a JSON body with a list of product ids.
 """
 
 import csv
 import io
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import and_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -60,6 +68,31 @@ class ProductOut(BaseModel):
         from_attributes = True  # Pydantic v2 (replaces orm_mode)
 
 
+class ProductCreateRequest(BaseModel):
+    """Schema for manually creating a single product."""
+    external_id: str
+    name: str
+    list_price: float
+    mam: float
+    currency: str = "PKR"
+    active: bool = True
+
+    @field_validator("list_price", "mam", mode="before")
+    @classmethod
+    def must_be_greater_than_zero(cls, v: float) -> float:
+        if v is not None and v <= 0:
+            raise ValueError("Value must be greater than 0")
+        return v
+
+    @model_validator(mode="after")
+    def mam_must_not_exceed_price(self):
+        if self.mam > self.list_price:
+            raise ValueError(
+                f"mam ({self.mam}) cannot exceed list_price ({self.list_price})"
+            )
+        return self
+
+
 class ProductPatchRequest(BaseModel):
     """
     All fields are optional so the caller can send only what changed.
@@ -75,9 +108,14 @@ class ProductPatchRequest(BaseModel):
     @field_validator("list_price", "mam", mode="before")
     @classmethod
     def must_be_positive(cls, v: float | None) -> float | None:
-        if v is not None and v < 0:
-            raise ValueError("Price values must be non-negative")
+        if v is not None and v <= 0:
+            raise ValueError("Value must be greater than 0")
         return v
+
+
+class BulkDeleteRequest(BaseModel):
+    """Request body for deleting multiple products at once."""
+    product_ids: List[int]
 
 
 class UploadSummary(BaseModel):
@@ -189,7 +227,7 @@ async def upload_products(
     skipped = 0
     errors: list[dict] = []
 
-    rows_to_upsert: list[dict] = []
+    validated_rows: list[dict] = []
 
     for row_num, row in enumerate(reader, start=2):  # row 1 = header
         ext_id  = row.get(col_map["external_id"], "").strip()
@@ -222,6 +260,16 @@ async def upload_products(
             skipped += 1
             continue
 
+        # --- Business rule: prices must be > 0 ---
+        if list_price <= 0:
+            errors.append({"row": row_num, "reason": f"list_price ({list_price}) must be greater than 0"})
+            skipped += 1
+            continue
+        if mam <= 0:
+            errors.append({"row": row_num, "reason": f"mam ({mam}) must be greater than 0"})
+            skipped += 1
+            continue
+
         # --- Business rule: mam must not exceed list_price ---
         if mam > list_price:
             errors.append({
@@ -231,92 +279,73 @@ async def upload_products(
             skipped += 1
             continue
 
-        if list_price < 0 or mam < 0:
-            errors.append({"row": row_num, "reason": "Prices must be non-negative"})
-            skipped += 1
-            continue
-
-        rows_to_upsert.append({
-            "tenant_id":   current_tenant.id,
+        validated_rows.append({
             "external_id": ext_id,
             "name":        name,
             "list_price":  list_price,
             "mam":         mam,
             "currency":    currency.upper()[:10],
-            "active":      True,
         })
 
-    if not rows_to_upsert and not errors:
+    if not validated_rows and not errors:
         raise HTTPException(status_code=400, detail="CSV contained no data rows")
 
-    # --- Upsert valid rows in a single round-trip ---
-    if rows_to_upsert:
-        # PostgreSQL INSERT … ON CONFLICT DO UPDATE
-        stmt = (
-            pg_insert(TenantProduct)
-            .values(rows_to_upsert)
-            .on_conflict_do_update(
-                index_elements=["tenant_id", "external_id"],
-                set_={
-                    "name":       pg_insert(TenantProduct).excluded.name,
-                    "list_price": pg_insert(TenantProduct).excluded.list_price,
-                    "mam":        pg_insert(TenantProduct).excluded.mam,
-                    "currency":   pg_insert(TenantProduct).excluded.currency,
-                    "active":     pg_insert(TenantProduct).excluded.active,
-                    # updated_at is handled by the DB onupdate trigger in the model,
-                    # but we also set it explicitly so it's always refreshed on upsert.
-                    "updated_at": datetime.now(timezone.utc),
-                },
-            )
-            .returning(
-                TenantProduct.id,
-                TenantProduct.external_id,
-            )
-        )
-
-        try:
-            result = await db.execute(stmt)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            logger.exception(
-                "products/upload: DB upsert failed for tenant_id=%s", current_tenant.id
-            )
-            raise HTTPException(status_code=500, detail="Database error during upsert")
-
-        # Figure out inserted vs updated by comparing against what already existed.
-        # The simplest accurate way: count rows returned vs rows we attempted.
-        # We'll do a quick count query for rows that existed before.
-        ext_ids = [r["external_id"] for r in rows_to_upsert]
-        existing_count_result = await db.execute(
-            select(TenantProduct).where(
+    # --- Duplicate detection: skip rows whose external_id already exists ---
+    rows_to_insert: list[dict] = []
+    if validated_rows:
+        ext_ids = [r["external_id"] for r in validated_rows]
+        existing_result = await db.execute(
+            select(TenantProduct.external_id).where(
                 and_(
                     TenantProduct.tenant_id == current_tenant.id,
                     TenantProduct.external_id.in_(ext_ids),
                 )
             )
         )
-        # After the upsert committed, all rows exist — we can't tell new from old
-        # without a pre-upsert snapshot, so we count honestly:
-        # any rows we just committed are either new or updated.
-        # We record both counts as total processed / 0 rather than guess.
-        total_processed = len(rows_to_upsert)
-        # A practical split: re-query and mark all as updated if they already had
-        # an updated_at set before *this* commit — but that requires a pre-query.
-        # To keep it simple and honest we report total_processed as updated
-        # (upsert semantics: every row that reached the DB was "upserted").
-        inserted = total_processed   # reported as "processed" — semantically correct
-        updated = 0
+        existing_ids = {row[0] for row in existing_result.fetchall()}
 
+        for r in validated_rows:
+            if r["external_id"] in existing_ids:
+                errors.append({
+                    "row": "—",
+                    "reason": f"Product ID '{r['external_id']}' already exists — skipped",
+                })
+                skipped += 1
+            else:
+                rows_to_insert.append({
+                    "tenant_id":   current_tenant.id,
+                    "external_id": r["external_id"],
+                    "name":        r["name"],
+                    "list_price":  r["list_price"],
+                    "mam":         r["mam"],
+                    "currency":    r["currency"],
+                    "active":      True,
+                })
+
+    # --- Insert only genuinely new rows ---
+    if rows_to_insert:
+        stmt = pg_insert(TenantProduct).values(rows_to_insert)
+
+        try:
+            await db.execute(stmt)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception(
+                "products/upload: DB insert failed for tenant_id=%s", current_tenant.id
+            )
+            raise HTTPException(status_code=500, detail="Database error during insert")
+
+        inserted = len(rows_to_insert)
         logger.info(
-            "products/upload: upserted %d rows for tenant_id=%s",
-            total_processed,
+            "products/upload: inserted %d rows for tenant_id=%s",
+            inserted,
             current_tenant.id,
         )
 
     return UploadSummary(
         inserted=inserted,
-        updated=updated,
+        updated=0,
         skipped=skipped,
         errors=errors,
     )
@@ -403,6 +432,16 @@ async def update_product(
 
     # Validate after merge so partial patches (e.g. only mam) are checked
     # against the *current* list_price, not a missing one.
+    if product.list_price <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="list_price must be greater than 0",
+        )
+    if product.mam <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="mam must be greater than 0",
+        )
     if product.mam > product.list_price:
         raise HTTPException(
             status_code=422,
@@ -430,3 +469,173 @@ async def update_product(
         list(patch_data.keys()),
     )
     return product
+
+
+# ---------------------------------------------------------------------------
+# POST /api/saas/products  (manual single-product creation)
+# ---------------------------------------------------------------------------
+
+@router.post("/", response_model=ProductOut, status_code=201)
+async def create_product(
+    body: ProductCreateRequest,
+    current_tenant: Tenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually add a single product.
+
+    Returns 409 if a product with the same external_id already exists
+    for this tenant.
+    """
+    # Check for duplicate external_id
+    existing = await db.execute(
+        select(TenantProduct).where(
+            and_(
+                TenantProduct.tenant_id == current_tenant.id,
+                TenantProduct.external_id == body.external_id.strip(),
+            )
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Product ID '{body.external_id}' already exists",
+        )
+
+    product = TenantProduct(
+        tenant_id=current_tenant.id,
+        external_id=body.external_id.strip(),
+        name=body.name.strip(),
+        list_price=body.list_price,
+        mam=body.mam,
+        currency=body.currency.upper()[:10],
+        active=body.active,
+    )
+
+    try:
+        db.add(product)
+        await db.commit()
+        await db.refresh(product)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "products/create: DB insert failed for tenant_id=%s", current_tenant.id
+        )
+        raise HTTPException(status_code=500, detail="Could not create product")
+
+    logger.info(
+        "TenantProduct created: id=%s external_id=%s tenant_id=%s",
+        product.id,
+        product.external_id,
+        current_tenant.id,
+    )
+    return product
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/saas/products/{product_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/{product_id}", status_code=200)
+async def delete_product(
+    product_id: int,
+    current_tenant: Tenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a single product by its database ID.
+
+    Returns 404 if the product does not exist or does not belong to
+    the authenticated tenant.
+    """
+    result = await db.execute(
+        select(TenantProduct).where(
+            and_(
+                TenantProduct.id == product_id,
+                TenantProduct.tenant_id == current_tenant.id,
+            )
+        )
+    )
+    product: TenantProduct | None = result.scalars().first()
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Product {product_id} not found or does not belong to your account",
+        )
+
+    try:
+        await db.delete(product)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "products/delete: DB delete failed for product_id=%s tenant_id=%s",
+            product_id,
+            current_tenant.id,
+        )
+        raise HTTPException(status_code=500, detail="Could not delete product")
+
+    logger.info(
+        "TenantProduct deleted: id=%s tenant_id=%s",
+        product_id,
+        current_tenant.id,
+    )
+    return {"detail": f"Product {product_id} deleted successfully"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/saas/products/bulk-delete
+# ---------------------------------------------------------------------------
+
+@router.post("/bulk-delete", status_code=200)
+async def bulk_delete_products(
+    body: BulkDeleteRequest,
+    current_tenant: Tenant = Depends(get_current_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete multiple products at once.
+
+    Accepts a JSON body: { "product_ids": [1, 2, 3] }
+
+    Only products belonging to the authenticated tenant are deleted.
+    Returns a summary of how many were deleted and which IDs were not found.
+    """
+    if not body.product_ids:
+        raise HTTPException(status_code=422, detail="product_ids must not be empty")
+
+    # Fetch all matching products owned by this tenant
+    result = await db.execute(
+        select(TenantProduct).where(
+            and_(
+                TenantProduct.id.in_(body.product_ids),
+                TenantProduct.tenant_id == current_tenant.id,
+            )
+        )
+    )
+    products = result.scalars().all()
+    found_ids = {p.id for p in products}
+    not_found_ids = [pid for pid in body.product_ids if pid not in found_ids]
+
+    try:
+        for product in products:
+            await db.delete(product)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "products/bulk-delete: DB delete failed for tenant_id=%s",
+            current_tenant.id,
+        )
+        raise HTTPException(status_code=500, detail="Could not delete products")
+
+    logger.info(
+        "TenantProduct bulk-delete: deleted %d products for tenant_id=%s",
+        len(found_ids),
+        current_tenant.id,
+    )
+    return {
+        "deleted": len(found_ids),
+        "deleted_ids": sorted(found_ids),
+        "not_found_ids": not_found_ids,
+    }
