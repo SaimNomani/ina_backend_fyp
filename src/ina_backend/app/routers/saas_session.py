@@ -34,9 +34,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List, Optional
 
 from src.ina_backend.app.database import get_db
-from src.ina_backend.app.models import AllowedDomain, SaasSession, Tenant, TenantProduct
+from src.ina_backend.app.models import AllowedDomain, SaasSession, Tenant, TenantProduct, NegotiationOutcome
 from src.ina_backend.app.redis_client import redis_client
 
 logger = logging.getLogger(__name__)
@@ -47,23 +48,45 @@ router = APIRouter()
 # Schemas (local — no need to pollute the shared schemas.py file)
 # ---------------------------------------------------------------------------
 
-class SaasSessionInitRequest(BaseModel):
-    """
-    Body sent by the tenant's storefront JS widget when a buyer starts
-    negotiating.
+# class SaasSessionInitRequest(BaseModel):
+#     """
+#     Body sent by the tenant's storefront JS widget when a buyer starts
+#     negotiating.
 
-    publicKey  – the tenant's client_api_key (acts as the "who am I" token)
-    productId  – tenant's own external product identifier (TenantProduct.external_id)
-    """
-    publicKey: str
-    productId: str
+#     publicKey  – the tenant's client_api_key (acts as the "who am I" token)
+#     productId  – tenant's own external product identifier (TenantProduct.external_id)
+#     """
+#     publicKey: str
+#     productId: str
+
+
+# class SaasSessionInitResponse(BaseModel):
+#     session_id: str
+#     list_price: float
+#     currency: str
+#     expires_at: datetime
+
+
+class SaasSessionInitRequest(BaseModel):
+    publicKey: str      # tenant's client_api_key
+    productId: str      # matches TenantProduct.external_id
+    anonId: str         # widget-generated UUID from localStorage — NEW
 
 
 class SaasSessionInitResponse(BaseModel):
-    session_id: str
-    list_price: float
-    currency: str
-    expires_at: datetime
+    session_id:      str
+    list_price:      float
+    currency:        str
+    expires_at:      datetime
+    # Resumption fields — NEW
+    # True = existing session returned, not a new one
+    resumed:         bool = False
+    status:          str = "ACTIVE"       # "ACTIVE" or "AGREED"
+    # populated when status == "AGREED"
+    final_price:     Optional[float] = None
+    # populated when status == "AGREED"
+    message_history: Optional[List[dict]] = None
+
 
 
 class SaasVerifyRequest(BaseModel):
@@ -81,194 +104,388 @@ class SaasVerifyResponse(BaseModel):
     verifiedAt: datetime
 
 
-# ---------------------------------------------------------------------------
-# Helper: normalise an Origin / Referer value to a bare hostname
-# ---------------------------------------------------------------------------
+# # ---------------------------------------------------------------------------
+# # Helper: normalise an Origin / Referer value to a bare hostname
+# # ---------------------------------------------------------------------------
+
+# def _normalise_origin(raw: str) -> str:
+#     """
+#     Given a value like 'https://shop.example.com' or 'shop.example.com'
+#     return just the netloc / hostname, lower-cased, with the leading 'www.'
+#     stripped so tenants don't have to register both variants.
+
+#     Raises ValueError if the value cannot be parsed to a hostname.
+#     """
+#     raw = raw.strip()
+#     if not raw.startswith(("http://", "https://")):
+#         # Treat as a bare host (e.g. already normalised, or from a unit test)
+#         raw = "https://" + raw
+#     parsed = urlparse(raw)
+#     host = parsed.hostname or ""
+#     if not host:
+#         raise ValueError(f"Cannot extract hostname from: {raw!r}")
+#     # Strip optional leading 'www.' for a consistent lookup key
+#     if host.startswith("www."):
+#         host = host[4:]
+#     return host.lower()
+
+
+# # ---------------------------------------------------------------------------
+# # POST /api/saas/session/init
+# # ---------------------------------------------------------------------------
+
+# SESSION_TTL_HOURS = 24
+
+
+# @router.post("/init", response_model=SaasSessionInitResponse)
+# async def saas_session_init(
+#     payload: SaasSessionInitRequest,
+#     request: Request,
+#     db: AsyncSession = Depends(get_db),
+# ):
+#     """
+#     Initialise a SaaS negotiation session.
+
+#     Security model
+#     --------------
+#     1. The tenant is identified by *publicKey* (their client_api_key).
+#     2. The request origin is validated against AllowedDomain to prevent
+#        other websites from piggybacking on a tenant's key.
+#     3. MAM is read from the database and stored server-side; it is *never*
+#        echoed back to the browser.
+#     """
+
+#     # ------------------------------------------------------------------
+#     # 1. Resolve tenant from publicKey
+#     # ------------------------------------------------------------------
+#     result = await db.execute(
+#         select(Tenant).where(Tenant.client_api_key == payload.publicKey)
+#     )
+#     tenant: Tenant | None = result.scalars().first()
+#     if not tenant:
+#         logger.warning("saas/init: unknown publicKey=%s", payload.publicKey[:8] + "…")
+#         raise HTTPException(status_code=401, detail="Invalid public key")
+
+#     # ------------------------------------------------------------------
+#     # 2. Validate the request origin against AllowedDomain
+#     # ------------------------------------------------------------------
+#     raw_origin = request.headers.get("origin") or request.headers.get("referer") or ""
+#     if not raw_origin:
+#         raise HTTPException(
+#             status_code=403,
+#             detail="Missing Origin header — widget must run in a browser context",
+#         )
+
+#     try:
+#         normalised_host = _normalise_origin(raw_origin)
+#     except ValueError as exc:
+#         raise HTTPException(status_code=403, detail=f"Unparseable Origin: {exc}") from exc
+
+#     domain_result = await db.execute(
+#         select(AllowedDomain).where(
+#             and_(
+#                 AllowedDomain.tenant_id == tenant.id,
+#                 AllowedDomain.domain == normalised_host,
+#             )
+#         )
+#     )
+#     if not domain_result.scalars().first():
+#         logger.warning(
+#             "saas/init: origin '%s' not in allowed domains for tenant_id=%s",
+#             normalised_host,
+#             tenant.id,
+#         )
+#         raise HTTPException(
+#             status_code=403,
+#             detail=f"Origin '{normalised_host}' is not authorised for this tenant",
+#         )
+
+#     # ------------------------------------------------------------------
+#     # 3. Look up the product
+#     # ------------------------------------------------------------------
+#     product_result = await db.execute(
+#         select(TenantProduct).where(
+#             and_(
+#                 TenantProduct.tenant_id == tenant.id,
+#                 TenantProduct.external_id == payload.productId,
+#                 TenantProduct.active.is_(True),
+#             )
+#         )
+#     )
+#     product: TenantProduct | None = product_result.scalars().first()
+#     if not product:
+#         raise HTTPException(
+#             status_code=404,
+#             detail=f"Product '{payload.productId}' not found or inactive",
+#         )
+
+#     # ------------------------------------------------------------------
+#     # 4. Create the session
+#     # ------------------------------------------------------------------
+#     session_id = str(uuid.uuid4())
+#     now = datetime.now(timezone.utc)
+#     expires_at = now + timedelta(hours=SESSION_TTL_HOURS)
+
+#     saas_session = SaasSession(
+#         id=session_id,
+#         tenant_id=tenant.id,
+#         product_id=product.id,
+#         origin_domain=normalised_host,
+#         mam_snapshot=product.mam,           # frozen at creation — never returned
+#         list_price_snap=product.list_price,
+#         status="ACTIVE",
+#         expires_at=expires_at,
+#     )
+#     db.add(saas_session)
+
+#     try:
+#         await db.commit()
+#         await db.refresh(saas_session)
+#         logger.info(
+#             "SaasSession created: session_id=%s tenant_id=%s product=%s",
+#             session_id,
+#             tenant.id,
+#             payload.productId,
+#         )
+#     except Exception:
+#         await db.rollback()
+#         logger.exception("saas/init: failed to persist SaasSession %s", session_id)
+#         raise HTTPException(status_code=500, detail="Could not create session")
+
+#     # ------------------------------------------------------------------
+#     # 5. Mirror into Redis (same layout as demo session.py so orchestrator
+#     #    needs zero changes)
+#     # ------------------------------------------------------------------
+#     redis_payload = {
+#         "tenant_id": str(tenant.id),
+#         "context_id": session_id,           # use session_id as context key
+#         "mam": product.mam,                 # orchestrator needs this internally
+#         "asking_price": product.list_price,
+#         "active": True,
+#         "messages": [],
+#         "offer_count": 0,
+#         "status": "negotiating",
+#         "last_bot_offer": None,
+#         # SaaS-specific marker so orchestrator / analytics can distinguish
+#         "saas": True,
+#     }
+#     try:
+#         await redis_client.set(
+#             session_id,
+#             json.dumps(redis_payload),
+#             ex=int(timedelta(hours=SESSION_TTL_HOURS).total_seconds()),
+#         )
+#     except Exception:
+#         # Non-fatal — the DB row is the source of truth; Redis is a cache.
+#         # Log prominently so ops can investigate.
+#         logger.exception(
+#             "saas/init: Redis write failed for session %s — orchestrator may not work",
+#             session_id,
+#         )
+
+#     # ------------------------------------------------------------------
+#     # 6. Return public info only — MAM is NOT in the response
+#     # ------------------------------------------------------------------
+#     return SaasSessionInitResponse(
+#         session_id=session_id,
+#         list_price=product.list_price,
+#         currency=product.currency,
+#         expires_at=expires_at,
+#     )
+
+SESSION_TTL_HOURS = 24
+
+
+# ── Domain normaliser ─────────────────────────────────────────────────────────
 
 def _normalise_origin(raw: str) -> str:
-    """
-    Given a value like 'https://shop.example.com' or 'shop.example.com'
-    return just the netloc / hostname, lower-cased, with the leading 'www.'
-    stripped so tenants don't have to register both variants.
-
-    Raises ValueError if the value cannot be parsed to a hostname.
-    """
-    raw = raw.strip()
-    if not raw.startswith(("http://", "https://")):
-        # Treat as a bare host (e.g. already normalised, or from a unit test)
-        raw = "https://" + raw
     parsed = urlparse(raw)
     host = parsed.hostname or ""
-    if not host:
-        raise ValueError(f"Cannot extract hostname from: {raw!r}")
-    # Strip optional leading 'www.' for a consistent lookup key
     if host.startswith("www."):
         host = host[4:]
     return host.lower()
 
 
-# ---------------------------------------------------------------------------
-# POST /api/saas/session/init
-# ---------------------------------------------------------------------------
+# ── Rate limit helper ─────────────────────────────────────────────────────────
 
-SESSION_TTL_HOURS = 24
+async def _is_new_session_rate_limited(
+    redis,
+    tenant_id: int,
+    product_external_id: str,
+    anon_id: str,
+    client_ip: str,
+) -> bool:
+    """
+    Two-layer check:
+      Layer 1 (primary):   anon_id  — catches normal browsers. Limit: 2/24h (allows 1 retry after clear)
+      Layer 2 (secondary): client IP — catches incognito / localStorage cleared. Limit: 5/24h
+    Returns True if EITHER layer is saturated.
+    """
+    WINDOW = SESSION_TTL_HOURS * 3600
 
+    # Layer 1: anon_id keyed
+    key_anon = f"ina:newsess:{tenant_id}:{product_external_id}:{anon_id}"
+    count_anon = await redis.incr(key_anon)
+    if count_anon == 1:
+        await redis.expire(key_anon, WINDOW)
+    if count_anon > 2:
+        return True
+
+    # Layer 2: IP keyed (more permissive — covers shared IPs / NAT)
+    key_ip = f"ina:newsess_ip:{tenant_id}:{product_external_id}:{client_ip}"
+    count_ip = await redis.incr(key_ip)
+    if count_ip == 1:
+        await redis.expire(key_ip, WINDOW)
+    if count_ip > 5:
+        return True
+
+    return False
+
+
+# ── Init endpoint ─────────────────────────────────────────────────────────────
 
 @router.post("/init", response_model=SaasSessionInitResponse)
 async def saas_session_init(
-    payload: SaasSessionInitRequest,
     request: Request,
+    payload: SaasSessionInitRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Initialise a SaaS negotiation session.
-
-    Security model
-    --------------
-    1. The tenant is identified by *publicKey* (their client_api_key).
-    2. The request origin is validated against AllowedDomain to prevent
-       other websites from piggybacking on a tenant's key.
-    3. MAM is read from the database and stored server-side; it is *never*
-       echoed back to the browser.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Resolve tenant from publicKey
-    # ------------------------------------------------------------------
+    # ── 1. Authenticate tenant via publicKey ──────────────────────────────────
     result = await db.execute(
         select(Tenant).where(Tenant.client_api_key == payload.publicKey)
     )
-    tenant: Tenant | None = result.scalars().first()
+    tenant: Optional[Tenant] = result.scalar_one_or_none()
     if not tenant:
-        logger.warning("saas/init: unknown publicKey=%s", payload.publicKey[:8] + "…")
-        raise HTTPException(status_code=401, detail="Invalid public key")
+        raise HTTPException(status_code=401, detail="Invalid public key.")
 
-    # ------------------------------------------------------------------
-    # 2. Validate the request origin against AllowedDomain
-    # ------------------------------------------------------------------
-    raw_origin = request.headers.get("origin") or request.headers.get("referer") or ""
-    if not raw_origin:
-        raise HTTPException(
-            status_code=403,
-            detail="Missing Origin header — widget must run in a browser context",
-        )
-
-    try:
-        normalised_host = _normalise_origin(raw_origin)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail=f"Unparseable Origin: {exc}") from exc
-
-    domain_result = await db.execute(
+    # ── 2. Origin domain validation ───────────────────────────────────────────
+    raw_origin = request.headers.get(
+        "origin") or request.headers.get("referer", "")
+    normalised = _normalise_origin(raw_origin)
+    allowed_q = await db.execute(
         select(AllowedDomain).where(
-            and_(
-                AllowedDomain.tenant_id == tenant.id,
-                AllowedDomain.domain == normalised_host,
-            )
+            AllowedDomain.tenant_id == tenant.id,
+            AllowedDomain.domain == normalised,
         )
     )
-    if not domain_result.scalars().first():
-        logger.warning(
-            "saas/init: origin '%s' not in allowed domains for tenant_id=%s",
-            normalised_host,
-            tenant.id,
-        )
+    if not allowed_q.scalar_one_or_none():
         raise HTTPException(
             status_code=403,
-            detail=f"Origin '{normalised_host}' is not authorised for this tenant",
+            detail=f"Origin '{normalised}' is not in your allowed domains list."
         )
 
-    # ------------------------------------------------------------------
-    # 3. Look up the product
-    # ------------------------------------------------------------------
-    product_result = await db.execute(
+    # ── 3. Resolve product ────────────────────────────────────────────────────
+    prod_q = await db.execute(
         select(TenantProduct).where(
-            and_(
-                TenantProduct.tenant_id == tenant.id,
-                TenantProduct.external_id == payload.productId,
-                TenantProduct.active.is_(True),
-            )
+            TenantProduct.tenant_id == tenant.id,
+            TenantProduct.external_id == payload.productId,
+            TenantProduct.active == True,
         )
     )
-    product: TenantProduct | None = product_result.scalars().first()
+    product: Optional[TenantProduct] = prod_q.scalar_one_or_none()
     if not product:
         raise HTTPException(
             status_code=404,
-            detail=f"Product '{payload.productId}' not found or inactive",
+            detail=f"Product '{payload.productId}' not found or inactive."
         )
 
-    # ------------------------------------------------------------------
-    # 4. Create the session
-    # ------------------------------------------------------------------
-    session_id = str(uuid.uuid4())
+    # ── 4. PRIORITY 1: Look up an existing resumable session ──────────────────
+    #
+    # Resumable = status is ACTIVE or AGREED (not VERIFIED — that means deal was purchased)
+    # AND the session has not yet expired
+    #
     now = datetime.now(timezone.utc)
+    existing_q = await db.execute(
+        select(SaasSession).where(
+            and_(
+                SaasSession.tenant_id == tenant.id,
+                SaasSession.product_id == product.id,
+                SaasSession.anon_id == payload.anonId,
+                SaasSession.status.in_(["ACTIVE", "AGREED"]),
+                SaasSession.expires_at > now,
+            )
+        )
+        # most recent first in edge case of duplicates
+        .order_by(SaasSession.created_at.desc())
+        .limit(1)
+    )
+    existing: Optional[SaasSession] = existing_q.scalar_one_or_none()
+
+    if existing:
+        # ── RESUME PATH ───────────────────────────────────────────────────────
+        logger.info(
+            "Session RESUMED: session_id=%s status=%s anon_id=%s",
+            existing.id, existing.status, payload.anonId,
+        )
+
+        # For AGREED sessions, fetch message_history from NegotiationOutcome so
+        # the widget can restore the full conversation display
+        message_history = None
+        if existing.status == "AGREED":
+            outcome_q = await db.execute(
+                select(NegotiationOutcome).where(
+                    NegotiationOutcome.session_id == existing.id
+                )
+            )
+            outcome = outcome_q.scalar_one_or_none()
+            if outcome and outcome.message_history:
+                message_history = outcome.message_history
+
+        return SaasSessionInitResponse(
+            session_id=existing.id,
+            list_price=existing.list_price_snap,
+            currency=product.currency,
+            expires_at=existing.expires_at,
+            resumed=True,
+            status=existing.status,
+            final_price=existing.final_price if existing.status == "AGREED" else None,
+            message_history=message_history,
+        )
+
+    # ── 5. PRIORITY 2: Rate limit check before creating anything new ──────────
+    client_ip = request.client.host
+    if await _is_new_session_rate_limited(
+        redis_client, tenant.id, payload.productId, payload.anonId, client_ip
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Negotiation limit reached. You may only start a new negotiation "
+                   "for this product once per 24 hours. Please try again later.",
+        )
+
+    # ── 6. PRIORITY 3: Create a fresh session ────────────────────────────────
+    session_id = str(uuid.uuid4())
     expires_at = now + timedelta(hours=SESSION_TTL_HOURS)
 
-    saas_session = SaasSession(
+    new_session = SaasSession(
         id=session_id,
         tenant_id=tenant.id,
         product_id=product.id,
-        origin_domain=normalised_host,
-        mam_snapshot=product.mam,           # frozen at creation — never returned
+        origin_domain=normalised,
+        mam_snapshot=product.mam,         # MAM frozen at session start — NEVER returned
         list_price_snap=product.list_price,
         status="ACTIVE",
         expires_at=expires_at,
+        anon_id=payload.anonId,      # NEW: bind session to this anonymous user
     )
-    db.add(saas_session)
+    db.add(new_session)
+    await db.commit()
 
-    try:
-        await db.commit()
-        await db.refresh(saas_session)
-        logger.info(
-            "SaasSession created: session_id=%s tenant_id=%s product=%s",
-            session_id,
-            tenant.id,
-            payload.productId,
-        )
-    except Exception:
-        await db.rollback()
-        logger.exception("saas/init: failed to persist SaasSession %s", session_id)
-        raise HTTPException(status_code=500, detail="Could not create session")
+    logger.info(
+        "New SaasSession created: session_id=%s tenant=%d product=%s anon_id=%s",
+        session_id, tenant.id, payload.productId, payload.anonId,
+    )
 
-    # ------------------------------------------------------------------
-    # 5. Mirror into Redis (same layout as demo session.py so orchestrator
-    #    needs zero changes)
-    # ------------------------------------------------------------------
-    redis_payload = {
-        "tenant_id": str(tenant.id),
-        "context_id": session_id,           # use session_id as context key
-        "mam": product.mam,                 # orchestrator needs this internally
-        "asking_price": product.list_price,
-        "active": True,
-        "messages": [],
-        "offer_count": 0,
-        "status": "negotiating",
-        "last_bot_offer": None,
-        # SaaS-specific marker so orchestrator / analytics can distinguish
-        "saas": True,
-    }
-    try:
-        await redis_client.set(
-            session_id,
-            json.dumps(redis_payload),
-            ex=int(timedelta(hours=SESSION_TTL_HOURS).total_seconds()),
-        )
-    except Exception:
-        # Non-fatal — the DB row is the source of truth; Redis is a cache.
-        # Log prominently so ops can investigate.
-        logger.exception(
-            "saas/init: Redis write failed for session %s — orchestrator may not work",
-            session_id,
-        )
-
-    # ------------------------------------------------------------------
-    # 6. Return public info only — MAM is NOT in the response
-    # ------------------------------------------------------------------
     return SaasSessionInitResponse(
         session_id=session_id,
         list_price=product.list_price,
         currency=product.currency,
         expires_at=expires_at,
+        resumed=False,
+        status="ACTIVE",
     )
+
+
 
 
 # ---------------------------------------------------------------------------
