@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, UniqueConstraint, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, UniqueConstraint, Boolean, Index
 from sqlalchemy.sql import func, text
 from .database import Base
 
@@ -77,17 +77,39 @@ class TenantProduct(Base):
     __table_args__ = (UniqueConstraint("tenant_id", "external_id"),)
 
 
+# class SaasSession(Base):
+#     __tablename__ = "saas_sessions"
+#     id = Column(String(36), primary_key=True)  # UUID
+#     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+#     product_id = Column(Integer, ForeignKey(
+#         "tenant_products.id"), nullable=False)
+#     origin_domain = Column(String(255), nullable=False)
+#     mam_snapshot = Column(Float, nullable=False)      # frozen at session start
+#     list_price_snap = Column(Float, nullable=False)
+#     final_price = Column(Float, nullable=True)
+#     status = Column(String(20), default="ACTIVE")  # ACTIVE→AGREED→VERIFIED
+#     expires_at = Column(DateTime(timezone=True), nullable=False)
+#     verified_at = Column(DateTime(timezone=True), nullable=True)
+#     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 class SaasSession(Base):
     __tablename__ = "saas_sessions"
-    id = Column(String(36), primary_key=True)  # UUID
+    id = Column(String(36), primary_key=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     product_id = Column(Integer, ForeignKey(
         "tenant_products.id"), nullable=False)
     origin_domain = Column(String(255), nullable=False)
-    mam_snapshot = Column(Float, nullable=False)      # frozen at session start
+    mam_snapshot = Column(Float, nullable=False)
     list_price_snap = Column(Float, nullable=False)
     final_price = Column(Float, nullable=True)
-    status = Column(String(20), default="ACTIVE")  # ACTIVE→AGREED→VERIFIED
+    status = Column(String(20), default="ACTIVE")   # ACTIVE→AGREED→VERIFIED
     expires_at = Column(DateTime(timezone=True), nullable=False)
     verified_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # ── NEW ──────────────────────────────────────────────────────────────────
+    anon_id = Column(String(64), nullable=True, index=True)
+    # Composite index for the lookup query: tenant × product × user
+    __table_args__ = (
+        Index("ix_saas_session_lookup", "tenant_id", "product_id", "anon_id"),
+    )
