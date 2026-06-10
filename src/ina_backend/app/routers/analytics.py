@@ -183,10 +183,10 @@ async def get_analytics(
     tid = current_tenant.id
     join_cond = NegotiationOutcome.session_id == SaasSession.id
 
-    # A. Total sessions — every NegotiationOutcome row for this tenant
+    # A. Total sessions (Chats) — every SaasSession row for this tenant
+    # Decoupled from NegotiationOutcome to include active & abandoned chats
     q_total = (
-        select(func.count(NegotiationOutcome.id))
-        .join(SaasSession, join_cond)
+        select(func.count(SaasSession.id))
         .where(SaasSession.tenant_id == tid)
     )
     total_sessions: int = (await db.execute(q_total)).scalar() or 0
@@ -242,33 +242,46 @@ async def get_daily_analytics(
         today.year, today.month, today.day, tzinfo=timezone.utc
     ) - timedelta(days=6)
 
-    q = (
+    # 1. Total Chats per day (from SaasSession directly)
+    q_chats = (
+        select(
+            cast(SaasSession.created_at, Date).label("day"),
+            func.count(SaasSession.id).label("total"),
+        )
+        .where(
+            SaasSession.tenant_id == tid,
+            SaasSession.created_at >= window_start,
+        )
+        .group_by(cast(SaasSession.created_at, Date))
+    )
+    chat_rows = (await db.execute(q_chats)).all()
+
+    # 2. Deals Closed per day (from NegotiationOutcome)
+    q_deals = (
         select(
             cast(NegotiationOutcome.created_at, Date).label("day"),
-            func.count(NegotiationOutcome.id).label("total"),
-            func.sum(
-                case(
-                    (NegotiationOutcome.outcome.in_(_DEAL_OUTCOMES), 1),
-                    else_=0,
-                )
-            ).label("deals"),
+            func.count(NegotiationOutcome.id).label("deals"),
         )
         .join(SaasSession, NegotiationOutcome.session_id == SaasSession.id)
         .where(
             SaasSession.tenant_id == tid,
             NegotiationOutcome.created_at >= window_start,
+            NegotiationOutcome.outcome.in_(_DEAL_OUTCOMES),
         )
         .group_by(cast(NegotiationOutcome.created_at, Date))
-        .order_by(cast(NegotiationOutcome.created_at, Date))
     )
+    deal_rows = (await db.execute(q_deals)).all()
 
-    rows = (await db.execute(q)).all()
-
-    # Index rows by date string for O(1) lookup
-    day_map = {
-        str(r.day): {"total": r.total, "deals": int(r.deals or 0)}
-        for r in rows
-    }
+    # Merge into O(1) lookup map
+    day_map = {}
+    for r in chat_rows:
+        day_map[str(r.day)] = {"total": r.total, "deals": 0}
+        
+    for r in deal_rows:
+        day_str = str(r.day)
+        if day_str not in day_map:
+            day_map[day_str] = {"total": 0, "deals": 0}
+        day_map[day_str]["deals"] = r.deals
 
     # Build a guaranteed 7-entry list, filling gaps with zeros
     result = []
