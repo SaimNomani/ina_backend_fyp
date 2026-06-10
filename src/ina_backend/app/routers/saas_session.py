@@ -547,7 +547,7 @@ async def _is_new_session_rate_limited(
     count_anon = await redis.incr(key_anon)
     if count_anon == 1:
         await redis.expire(key_anon, WINDOW)
-    if count_anon > 2:
+    if count_anon > 1:
         return True
 
     key_ip = f"ina:newsess_ip:{tenant_id}:{product_external_id}:{client_ip}"
