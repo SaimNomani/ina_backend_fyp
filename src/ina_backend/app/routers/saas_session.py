@@ -417,7 +417,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 
@@ -515,6 +515,19 @@ def _normalise_origin(raw: str) -> str:
     return host.lower()
 
 
+# ── Advisory-lock helper (prevents duplicate sessions on rapid reload) ────────
+
+def _session_lock_key(tenant_id: int, product_id: int, anon_id: str) -> int:
+    """
+    Deterministic bigint from (tenant, product, anon) for pg_advisory_xact_lock.
+    Concurrent /init calls with the same triple are serialised so the second
+    caller always sees the row committed by the first.
+    """
+    raw = f"saas_session:{tenant_id}:{product_id}:{anon_id}"
+    digest = hashlib.md5(raw.encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
 # ── Rate-limit helper ─────────────────────────────────────────────────────────
 
 async def _is_new_session_rate_limited(
@@ -595,6 +608,14 @@ async def saas_session_init(
             status_code=404,
             detail=f"Product '{payload.productId}' not found or inactive.",
         )
+
+    # ── 3b. Serialize concurrent requests for same (tenant, product, user) ────
+    #    pg_advisory_xact_lock blocks until the transaction holding the same key
+    #    commits or rolls back.  This turns the SELECT-then-INSERT below into an
+    #    effectively atomic check-and-create, eliminating duplicates caused by
+    #    rapid widget reloads or double-fires.
+    lock_key = _session_lock_key(tenant.id, product.id, payload.anonId)
+    await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
 
     # ── 4. PRIORITY 1: Resume existing ACTIVE/AGREED session ─────────────────
     now = datetime.now(timezone.utc)
